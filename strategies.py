@@ -1,6 +1,5 @@
 """
-STRATEGIE DI TRADING
-Ogni funzione ritorna None (nessun segnale) o un dict con i dettagli del segnale.
+STRATEGIE DI TRADING — indicatori calcolati manualmente (no pandas-ta)
 """
 
 import logging
@@ -9,7 +8,6 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
 import yfinance as yf
 import pytz
 
@@ -18,14 +16,12 @@ logger = logging.getLogger(__name__)
 ROME_TZ = pytz.timezone("Europe/Rome")
 ET_TZ   = pytz.timezone("America/New_York")
 
-# ── Ticker yfinance (più vicini ai CFD Revolut) ───────────────────────────────
 TICKER_SP500  = "^GSPC"
 TICKER_NASDAQ = "^NDX"
 TICKER_GOLD   = "GC=F"
 TICKER_WTI    = "CL=F"
 
 
-# ── Helper: scarica dati ──────────────────────────────────────────────────────
 def get_data(ticker: str, period: str, interval: str) -> Optional[pd.DataFrame]:
     try:
         df = yf.download(ticker, period=period, interval=interval,
@@ -40,42 +36,75 @@ def get_data(ticker: str, period: str, interval: str) -> Optional[pd.DataFrame]:
         return None
 
 
-# ── Helper: VWAP giornaliero ──────────────────────────────────────────────────
+def ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
+
+def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain  = delta.clip(lower=0).ewm(span=length, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(span=length, adjust=False).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    high, low, close = df["High"], df["Low"], df["Close"]
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(span=length, adjust=False).mean()
+
+def bollinger(series: pd.Series, length: int = 20, std: float = 2.2):
+    mid   = series.rolling(length).mean()
+    sigma = series.rolling(length).std()
+    return mid, mid + std * sigma, mid - std * sigma
+
+def supertrend(df: pd.DataFrame, length: int = 10, multiplier: float = 3.0):
+    atr_s  = atr(df, length)
+    hl2    = (df["High"] + df["Low"]) / 2
+    upper  = (hl2 + multiplier * atr_s).copy()
+    lower  = (hl2 - multiplier * atr_s).copy()
+    st     = pd.Series(index=df.index, dtype=float)
+    trend  = pd.Series(index=df.index, dtype=int)
+
+    for i in range(1, len(df)):
+        prev_lower = lower.iloc[i-1]
+        prev_upper = upper.iloc[i-1]
+        prev_close = df["Close"].iloc[i-1]
+
+        lower.iloc[i] = lower.iloc[i] if (lower.iloc[i] > prev_lower or prev_close < prev_lower) else prev_lower
+        upper.iloc[i] = upper.iloc[i] if (upper.iloc[i] < prev_upper or prev_close > prev_upper) else prev_upper
+
+        if df["Close"].iloc[i] > prev_upper:
+            trend.iloc[i] = 1
+        elif df["Close"].iloc[i] < prev_lower:
+            trend.iloc[i] = -1
+        else:
+            trend.iloc[i] = trend.iloc[i-1] if i > 0 else 1
+
+        st.iloc[i] = lower.iloc[i] if trend.iloc[i] == 1 else upper.iloc[i]
+
+    return st, trend
+
 def calc_vwap(df: pd.DataFrame) -> pd.Series:
-    """
-    Calcola il VWAP resettato ogni giorno.
-    Funziona solo su dati intraday con DatetimeIndex timezone-aware.
-    """
-    df = df.copy()
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
+    typical    = (df["High"] + df["Low"] + df["Close"]) / 3
+    df         = df.copy()
+    df["_tp"]  = typical * df["Volume"]
+    df["_date"]= df.index.date
+    parts = []
+    for d, g in df.groupby("_date"):
+        parts.append(g["_tp"].cumsum() / g["Volume"].cumsum())
+    return pd.concat(parts).reindex(df.index)
 
-    typical = (df["High"] + df["Low"] + df["Close"]) / 3
-    df["_tp_vol"] = typical * df["Volume"]
-    df["_date"]   = df.index.date
-
-    vwap_values = []
-    for d, group in df.groupby("_date"):
-        cum_tp_vol = group["_tp_vol"].cumsum()
-        cum_vol    = group["Volume"].cumsum()
-        vwap_day   = cum_tp_vol / cum_vol
-        vwap_values.append(vwap_day)
-
-    return pd.concat(vwap_values).reindex(df.index)
-
-
-# ── Helper: resample 1H → 4H ──────────────────────────────────────────────────
 def resample_4h(df: pd.DataFrame) -> pd.DataFrame:
     return df.resample("4h").agg({
-        "Open":  "first",
-        "High":  "max",
-        "Low":   "min",
-        "Close": "last",
-        "Volume":"sum"
+        "Open": "first", "High": "max",
+        "Low": "min",    "Close": "last", "Volume": "sum"
     }).dropna()
 
-
-# ── Helper: formatta prezzo ───────────────────────────────────────────────────
 def fmt(value, decimals=2) -> str:
     try:
         return f"{float(value):.{decimals}f}"
@@ -83,258 +112,143 @@ def fmt(value, decimals=2) -> str:
         return str(value)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STRATEGIA 1 — "SURFISTA" — Trend Following S&P500 1H
-# Logica: EMA 9 cross EMA 21 + RSI 14 confermato
-# ══════════════════════════════════════════════════════════════════════════════
 def check_surfista() -> Optional[dict]:
     df = get_data(TICKER_SP500, period="30d", interval="1h")
     if df is None or len(df) < 50:
         return None
 
-    # Indicatori
-    df["ema9"]  = ta.ema(df["Close"], length=9)
-    df["ema21"] = ta.ema(df["Close"], length=21)
-    df["rsi"]   = ta.rsi(df["Close"], length=14)
-    atr_series  = ta.atr(df["High"], df["Low"], df["Close"], length=14)
-    df["atr"]   = atr_series
-
+    df["ema9"]  = ema(df["Close"], 9)
+    df["ema21"] = ema(df["Close"], 21)
+    df["rsi"]   = rsi(df["Close"], 14)
+    df["atr"]   = atr(df, 14)
     df.dropna(inplace=True)
     if len(df) < 3:
         return None
 
-    # Filtro orario: 15:30–21:00 CET
-    last_bar_cet = df.index[-1].tz_convert(ROME_TZ)
-    if not (time(15, 30) <= last_bar_cet.time() <= time(21, 0)):
-        logger.info("[Surfista] Fuori orario operativo")
+    last_cet = df.index[-1].tz_convert(ROME_TZ)
+    if not (time(15, 30) <= last_cet.time() <= time(21, 0)):
+        logger.info("[Surfista] Fuori orario")
         return None
 
-    prev  = df.iloc[-2]
-    curr  = df.iloc[-1]
-
-    # Crossover EMA (barra precedente ema9 < ema21, barra corrente ema9 > ema21)
+    prev, curr = df.iloc[-2], df.iloc[-1]
     cross_up   = prev["ema9"] <= prev["ema21"] and curr["ema9"] > curr["ema21"]
     cross_down = prev["ema9"] >= prev["ema21"] and curr["ema9"] < curr["ema21"]
-
     entry = curr["Close"]
-    atr   = curr["atr"]
+    a     = curr["atr"]
 
     if cross_up and curr["rsi"] > 50:
-        sl = entry - 1.5 * atr
-        tp = entry + 3.0 * atr
-        return {
-            "strategia": "🟢 SURFISTA",
-            "asset":      "S&P 500",
-            "timeframe":  "1H",
-            "direzione":  "LONG",
-            "entry":      fmt(entry, 2),
-            "sl":         fmt(sl, 2),
-            "tp":         fmt(tp, 2),
-            "rr":         "1:2",
-            "note":       "EMA9 incrocia al rialzo EMA21 | RSI > 50"
-        }
+        return {"strategia": "🟢 SURFISTA", "asset": "S&P 500", "timeframe": "1H",
+                "direzione": "LONG",  "entry": fmt(entry),
+                "sl": fmt(entry - 1.5*a), "tp": fmt(entry + 3.0*a),
+                "rr": "1:2", "note": "EMA9 cross rialzista EMA21 | RSI > 50"}
 
     if cross_down and curr["rsi"] < 50:
-        sl = entry + 1.5 * atr
-        tp = entry - 3.0 * atr
-        return {
-            "strategia": "🔴 SURFISTA",
-            "asset":      "S&P 500",
-            "timeframe":  "1H",
-            "direzione":  "SHORT",
-            "entry":      fmt(entry, 2),
-            "sl":         fmt(sl, 2),
-            "tp":         fmt(tp, 2),
-            "rr":         "1:2",
-            "note":       "EMA9 incrocia al ribasso EMA21 | RSI < 50"
-        }
-
+        return {"strategia": "🔴 SURFISTA", "asset": "S&P 500", "timeframe": "1H",
+                "direzione": "SHORT", "entry": fmt(entry),
+                "sl": fmt(entry + 1.5*a), "tp": fmt(entry - 3.0*a),
+                "rr": "1:2", "note": "EMA9 cross ribassista EMA21 | RSI < 50"}
     return None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STRATEGIA 2 — "IL PENDOLO" — Mean Reversion Oro 1H
-# Logica: BB (20, 2.2) + RSI estremo (< 25 / > 75) + VWAP
-# ══════════════════════════════════════════════════════════════════════════════
 def check_pendolo() -> Optional[dict]:
     df = get_data(TICKER_GOLD, period="30d", interval="1h")
     if df is None or len(df) < 50:
         return None
 
-    # Bollinger Bands
-    bb = ta.bbands(df["Close"], length=20, std=2.2)
-    df["bb_upper"] = bb["BBU_20_2.2"]
-    df["bb_lower"] = bb["BBL_20_2.2"]
-    df["bb_mid"]   = bb["BBM_20_2.2"]
+    df["rsi"]                               = rsi(df["Close"], 14)
+    df["atr"]                               = atr(df, 14)
+    df["bb_mid"], df["bb_up"], df["bb_low"] = bollinger(df["Close"], 20, 2.2)
 
-    df["rsi"] = ta.rsi(df["Close"], length=14)
-    atr_s     = ta.atr(df["High"], df["Low"], df["Close"], length=14)
-    df["atr"] = atr_s
-
-    # VWAP
     try:
         df["vwap"] = calc_vwap(df)
     except Exception:
-        df["vwap"] = df["Close"].rolling(20).mean()  # fallback
+        df["vwap"] = df["Close"].rolling(20).mean()
 
     df.dropna(inplace=True)
     if len(df) < 3:
         return None
 
-    # Filtro orario: 08:00–18:00 CET
-    last_bar_cet = df.index[-1].tz_convert(ROME_TZ)
-    if not (time(8, 0) <= last_bar_cet.time() <= time(18, 0)):
-        logger.info("[Pendolo] Fuori orario operativo")
+    last_cet = df.index[-1].tz_convert(ROME_TZ)
+    if not (time(8, 0) <= last_cet.time() <= time(18, 0)):
+        logger.info("[Pendolo] Fuori orario")
         return None
 
     curr  = df.iloc[-1]
     entry = curr["Close"]
-    atr   = curr["atr"]
+    a     = curr["atr"]
 
-    # LONG: prezzo sotto BB inferiore + RSI ipervenduto + sotto VWAP
-    if (curr["Close"] < curr["bb_lower"] and
-            curr["rsi"] < 25 and
-            curr["Close"] < curr["vwap"]):
-        sl = entry - 1.3 * atr
-        tp = curr["bb_mid"]  # target: ritorno alla media
-        return {
-            "strategia": "🟡 IL PENDOLO",
-            "asset":      "Oro (XAU/USD)",
-            "timeframe":  "1H",
-            "direzione":  "LONG",
-            "entry":      fmt(entry, 2),
-            "sl":         fmt(sl, 2),
-            "tp":         fmt(tp, 2),
-            "rr":         "~1.3:1 – 1.8:1",
-            "note":       "Prezzo < BB Lower | RSI < 25 | Sotto VWAP → mean reversion"
-        }
+    if curr["Close"] < curr["bb_low"] and curr["rsi"] < 25 and curr["Close"] < curr["vwap"]:
+        return {"strategia": "🟡 IL PENDOLO", "asset": "Oro (XAU/USD)", "timeframe": "1H",
+                "direzione": "LONG",  "entry": fmt(entry),
+                "sl": fmt(entry - 1.3*a), "tp": fmt(curr["bb_mid"]),
+                "rr": "~1.5:1", "note": "Prezzo < BB Lower | RSI < 25 | Sotto VWAP"}
 
-    # SHORT: prezzo sopra BB superiore + RSI ipercomprato + sopra VWAP
-    if (curr["Close"] > curr["bb_upper"] and
-            curr["rsi"] > 75 and
-            curr["Close"] > curr["vwap"]):
-        sl = entry + 1.3 * atr
-        tp = curr["bb_mid"]
-        return {
-            "strategia": "🔴 IL PENDOLO",
-            "asset":      "Oro (XAU/USD)",
-            "timeframe":  "1H",
-            "direzione":  "SHORT",
-            "entry":      fmt(entry, 2),
-            "sl":         fmt(sl, 2),
-            "tp":         fmt(tp, 2),
-            "rr":         "~1.3:1 – 1.8:1",
-            "note":       "Prezzo > BB Upper | RSI > 75 | Sopra VWAP → mean reversion"
-        }
-
+    if curr["Close"] > curr["bb_up"] and curr["rsi"] > 75 and curr["Close"] > curr["vwap"]:
+        return {"strategia": "🔴 IL PENDOLO", "asset": "Oro (XAU/USD)", "timeframe": "1H",
+                "direzione": "SHORT", "entry": fmt(entry),
+                "sl": fmt(entry + 1.3*a), "tp": fmt(curr["bb_mid"]),
+                "rr": "~1.5:1", "note": "Prezzo > BB Upper | RSI > 75 | Sopra VWAP"}
     return None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STRATEGIA 3 — "ROMPIGHIACCIO" — Breakout Apertura USA Nasdaq 15min
-# Logica: range prime 2 candele (9:30–10:00 ET) + EMA + VWAP
-# ══════════════════════════════════════════════════════════════════════════════
 def check_rompighiaccio() -> Optional[dict]:
     df = get_data(TICKER_NASDAQ, period="5d", interval="15m")
     if df is None or len(df) < 20:
         return None
 
-    # Converti in ET per lavorare con la sessione NYSE
     if df.index.tz is None:
         df.index = df.index.tz_localize("UTC")
     df.index = df.index.tz_convert(ET_TZ)
 
     today_et = datetime.now(ET_TZ).date()
     today_df = df[df.index.date == today_et].copy()
-
     if len(today_df) < 3:
         return None
 
-    # Dati dalla sessione (9:30 ET in poi)
     session = today_df[today_df.index.time >= time(9, 30)].copy()
     if len(session) < 3:
         return None
 
-    # Range iniziale: prime 2 candele (9:30–10:00 ET)
-    range_candles = session.iloc[:2]
-    range_high = range_candles["High"].max()
-    range_low  = range_candles["Low"].min()
+    range_high = session.iloc[:2]["High"].max()
+    range_low  = session.iloc[:2]["Low"].min()
 
-    # Indicatori sull'intero df (per avere abbastanza dati per EMA)
-    df_full = df.copy()
-    df_full["ema21"] = ta.ema(df_full["Close"], length=21)
-    df_full["ema50"] = ta.ema(df_full["Close"], length=50)
-    atr_s            = ta.atr(df_full["High"], df_full["Low"], df_full["Close"], length=14)
-    df_full["atr"]   = atr_s
-
+    df["ema21"] = ema(df["Close"], 21)
+    df["ema50"] = ema(df["Close"], 50)
+    df["atr"]   = atr(df, 14)
     try:
-        df_full["vwap"] = calc_vwap(df_full)
+        df["vwap"] = calc_vwap(df)
     except Exception:
-        df_full["vwap"] = df_full["Close"].rolling(20).mean()
+        df["vwap"] = df["Close"].rolling(20).mean()
+    df.dropna(inplace=True)
 
-    df_full.dropna(inplace=True)
-
-    # Ultima candela disponibile
-    curr_idx = df_full.index[-1]
+    curr_idx = df.index[-1]
     if curr_idx.date() != today_et:
         return None
 
-    curr = df_full.iloc[-1]
-
-    # Solo nella finestra 9:30–11:30 ET
+    curr      = df.iloc[-1]
     curr_time = curr_idx.time()
     if not (time(9, 30) <= curr_time <= time(11, 30)):
         return None
 
-    entry  = curr["Close"]
-    atr    = curr["atr"]
-    buffer = 0.3 * atr
+    entry = curr["Close"]
+    a     = curr["atr"]
+    buf   = 0.3 * a
 
-    # LONG breakout
-    if (curr["Close"] > range_high + buffer and
-            curr["Close"] > curr["vwap"] and
-            curr["ema21"] > curr["ema50"]):
-        sl = entry - 1.5 * atr
-        tp = entry + 3.0 * atr
-        return {
-            "strategia": "🔵 ROMPIGHIACCIO",
-            "asset":      "Nasdaq 100",
-            "timeframe":  "15min",
-            "direzione":  "LONG",
-            "entry":      fmt(entry, 2),
-            "sl":         fmt(sl, 2),
-            "tp":         fmt(tp, 2),
-            "rr":         "1:2",
-            "note":       f"Breakout range apertura (H: {fmt(range_high,2)}) | Sopra VWAP | ⚠️ Spread NAS100 alto su Revolut"
-        }
+    if curr["Close"] > range_high + buf and curr["Close"] > curr["vwap"] and curr["ema21"] > curr["ema50"]:
+        return {"strategia": "🔵 ROMPIGHIACCIO", "asset": "Nasdaq 100", "timeframe": "15min",
+                "direzione": "LONG",  "entry": fmt(entry),
+                "sl": fmt(entry - 1.5*a), "tp": fmt(entry + 3.0*a),
+                "rr": "1:2", "note": f"Breakout H:{fmt(range_high)} | Sopra VWAP | ⚠️ Spread alto NAS100"}
 
-    # SHORT breakout
-    if (curr["Close"] < range_low - buffer and
-            curr["Close"] < curr["vwap"] and
-            curr["ema21"] < curr["ema50"]):
-        sl = entry + 1.5 * atr
-        tp = entry - 3.0 * atr
-        return {
-            "strategia": "🔴 ROMPIGHIACCIO",
-            "asset":      "Nasdaq 100",
-            "timeframe":  "15min",
-            "direzione":  "SHORT",
-            "entry":      fmt(entry, 2),
-            "sl":         fmt(sl, 2),
-            "tp":         fmt(tp, 2),
-            "rr":         "1:2",
-            "note":       f"Breakout range apertura (L: {fmt(range_low,2)}) | Sotto VWAP | ⚠️ Spread NAS100 alto su Revolut"
-        }
-
+    if curr["Close"] < range_low - buf and curr["Close"] < curr["vwap"] and curr["ema21"] < curr["ema50"]:
+        return {"strategia": "🔴 ROMPIGHIACCIO", "asset": "Nasdaq 100", "timeframe": "15min",
+                "direzione": "SHORT", "entry": fmt(entry),
+                "sl": fmt(entry + 1.5*a), "tp": fmt(entry - 3.0*a),
+                "rr": "1:2", "note": f"Breakout L:{fmt(range_low)} | Sotto VWAP | ⚠️ Spread alto NAS100"}
     return None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STRATEGIA 4 — "BARILE CALDO" — Momentum WTI 4H
-# Logica: Supertrend (10, 3) cambia direzione + EMA 200
-# ══════════════════════════════════════════════════════════════════════════════
 def check_barile_caldo() -> Optional[dict]:
-    # Scarica 1H e resample a 4H
     df_1h = get_data(TICKER_WTI, period="120d", interval="1h")
     if df_1h is None or len(df_1h) < 50:
         return None
@@ -343,67 +257,32 @@ def check_barile_caldo() -> Optional[dict]:
     if len(df) < 50:
         return None
 
-    # Supertrend
-    st = ta.supertrend(df["High"], df["Low"], df["Close"],
-                       length=10, multiplier=3.0)
-    col_dir  = [c for c in st.columns if c.startswith("SUPERTd")]
-    col_line = [c for c in st.columns if c.startswith("SUPERT_")]
-
-    if not col_dir or not col_line:
-        logger.error("[Barile Caldo] Colonne Supertrend non trovate")
-        return None
-
-    df["st_dir"]  = st[col_dir[0]]
-    df["st_line"] = st[col_line[0]]
-    df["ema200"]  = ta.ema(df["Close"], length=200)
-    atr_s         = ta.atr(df["High"], df["Low"], df["Close"], length=14)
-    df["atr"]     = atr_s
-
+    df["ema200"]           = ema(df["Close"], 200)
+    df["atr"]              = atr(df, 14)
+    df["st"], df["st_dir"] = supertrend(df, 10, 3.0)
     df.dropna(inplace=True)
     if len(df) < 3:
         return None
 
-    prev = df.iloc[-2]
-    curr = df.iloc[-1]
-
+    prev, curr = df.iloc[-2], df.iloc[-1]
     entry = curr["Close"]
-    atr   = curr["atr"]
 
-    # Supertrend girato da BEAR a BULL (dir: da 1 a -1 in pandas_ta = bullish)
-    # Nota: in pandas_ta SUPERTd = 1 quando bearish, -1 quando bullish
-    turned_bull = prev["st_dir"] == 1  and curr["st_dir"] == -1
-    turned_bear = prev["st_dir"] == -1 and curr["st_dir"] == 1
+    turned_bull = prev["st_dir"] == -1 and curr["st_dir"] == 1
+    turned_bear = prev["st_dir"] == 1  and curr["st_dir"] == -1
 
     if turned_bull and curr["Close"] > curr["ema200"]:
-        sl   = curr["st_line"]
+        sl   = curr["st"]
         risk = entry - sl
-        tp   = entry + 2.0 * risk
-        return {
-            "strategia": "🛢️ BARILE CALDO",
-            "asset":      "Petrolio WTI",
-            "timeframe":  "4H (swing)",
-            "direzione":  "LONG",
-            "entry":      fmt(entry, 2),
-            "sl":         fmt(sl, 2),
-            "tp":         fmt(tp, 2),
-            "rr":         "1:2",
-            "note":       "Supertrend girato RIALZISTA | Prezzo sopra EMA200 | ⚠️ Verifica rollover future WTI"
-        }
+        return {"strategia": "🛢️ BARILE CALDO", "asset": "Petrolio WTI", "timeframe": "4H",
+                "direzione": "LONG",  "entry": fmt(entry),
+                "sl": fmt(sl), "tp": fmt(entry + 2.0*risk),
+                "rr": "1:2", "note": "Supertrend BULL | Sopra EMA200 | ⚠️ Verifica rollover WTI"}
 
     if turned_bear and curr["Close"] < curr["ema200"]:
-        sl   = curr["st_line"]
+        sl   = curr["st"]
         risk = sl - entry
-        tp   = entry - 2.0 * risk
-        return {
-            "strategia": "🔴 BARILE CALDO",
-            "asset":      "Petrolio WTI",
-            "timeframe":  "4H (swing)",
-            "direzione":  "SHORT",
-            "entry":      fmt(entry, 2),
-            "sl":         fmt(sl, 2),
-            "tp":         fmt(tp, 2),
-            "rr":         "1:2",
-            "note":       "Supertrend girato RIBASSISTA | Prezzo sotto EMA200 | ⚠️ Verifica rollover future WTI"
-        }
-
+        return {"strategia": "🔴 BARILE CALDO", "asset": "Petrolio WTI", "timeframe": "4H",
+                "direzione": "SHORT", "entry": fmt(entry),
+                "sl": fmt(sl), "tp": fmt(entry - 2.0*risk),
+                "rr": "1:2", "note": "Supertrend BEAR | Sotto EMA200 | ⚠️ Verifica rollover WTI"}
     return None
