@@ -1,7 +1,8 @@
 yfinance==0.2.38
 pandas==2.1.4
-pandas-ta==0.3.14b0
+pandas-ta
 numpy==1.26.4
 APScheduler==3.10.4
 requests==2.31.0
 pytz==2024.1
+scipy
