@@ -131,8 +131,10 @@ def main():
     scheduler.start()
 
     # 3. Messaggio avvio
-    send_startup_message()
-    logger.info("Bot in ascolto...")
+    try:
+        send_startup_message()
+    except Exception as e:
+        logger.error(f"Startup message error: {e}")
 
     # 4. Mantieni vivo
     while True:
