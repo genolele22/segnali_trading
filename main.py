@@ -1,20 +1,20 @@
 """
 TRADING BOT — Revolut CFD Signal System
-Strategie: Surfista (S&P500), Il Pendolo (Oro), Rompighiaccio (Nasdaq), Barile Caldo (WTI)
 """
 
 import os
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, time
 import pytz
-from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.events import EVENT_JOB_ERROR
 
 from strategies import check_surfista, check_pendolo, check_rompighiaccio, check_barile_caldo
 from notifier import send_telegram, send_startup_message
 from news_filter import is_news_window
 
-# ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -24,17 +24,10 @@ logger = logging.getLogger(__name__)
 
 ROME_TZ = pytz.timezone("Europe/Rome")
 
-# ── Stato segnali (anti-duplicazione) ────────────────────────────────────────
-# Tiene traccia dell'ultimo segnale inviato per ogni strategia
-# Formato: {"strategia": {"direzione": "LONG", "timestamp": datetime}}
 last_signals: dict = {}
 
 
 def should_send(strategy_name: str, direction: str, cooldown_hours: int = 4) -> bool:
-    """
-    Evita di inviare lo stesso segnale più volte nello stesso periodo.
-    Ritorna True se il segnale è nuovo o abbastanza distante dall'ultimo.
-    """
     now = datetime.now(ROME_TZ)
     if strategy_name not in last_signals:
         return True
@@ -47,14 +40,12 @@ def should_send(strategy_name: str, direction: str, cooldown_hours: int = 4) -> 
 
 
 def register_signal(strategy_name: str, direction: str):
-    """Registra l'invio di un segnale."""
     last_signals[strategy_name] = {
         "direzione": direction,
         "timestamp": datetime.now(ROME_TZ)
     }
 
 
-# ── Job: Surfista — S&P500 1H ─────────────────────────────────────────────────
 def job_surfista():
     logger.info("▶ Controllo SURFISTA (S&P500 1H)")
     try:
@@ -69,7 +60,6 @@ def job_surfista():
         logger.error(f"[Surfista] Errore: {e}")
 
 
-# ── Job: Il Pendolo — Oro 1H ──────────────────────────────────────────────────
 def job_pendolo():
     logger.info("▶ Controllo IL PENDOLO (Oro 1H)")
     try:
@@ -84,10 +74,8 @@ def job_pendolo():
         logger.error(f"[Pendolo] Errore: {e}")
 
 
-# ── Job: Rompighiaccio — Nasdaq 15min ─────────────────────────────────────────
 def job_rompighiaccio():
     now = datetime.now(ROME_TZ)
-    # Solo nella finestra apertura USA: 15:30–17:30 CET
     if not (time(15, 25) <= now.time() <= time(17, 35)):
         return
     logger.info("▶ Controllo ROMPIGHIACCIO (Nasdaq 15min)")
@@ -96,7 +84,6 @@ def job_rompighiaccio():
             logger.info("[Rompighiaccio] Finestra news — skip")
             return
         signal = check_rompighiaccio()
-        # Cooldown più breve: segnale di breakout vale una volta per sessione
         if signal and should_send("rompighiaccio", signal["direzione"], cooldown_hours=8):
             send_telegram(signal)
             register_signal("rompighiaccio", signal["direzione"])
@@ -104,12 +91,10 @@ def job_rompighiaccio():
         logger.error(f"[Rompighiaccio] Errore: {e}")
 
 
-# ── Job: Barile Caldo — WTI 4H ────────────────────────────────────────────────
 def job_barile_caldo():
     logger.info("▶ Controllo BARILE CALDO (WTI 4H)")
     try:
         signal = check_barile_caldo()
-        # Swing: cooldown lungo, un segnale ogni 12h al massimo
         if signal and should_send("barile_caldo", signal["direzione"], cooldown_hours=12):
             send_telegram(signal)
             register_signal("barile_caldo", signal["direzione"])
@@ -117,40 +102,61 @@ def job_barile_caldo():
         logger.error(f"[Barile Caldo] Errore: {e}")
 
 
-# ── Error handler scheduler ───────────────────────────────────────────────────
 def on_job_error(event):
     logger.error(f"Job fallito: {event.exception}")
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Health check server (richiesto da Railway) ────────────────────────────────
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Trading Bot OK")
+
+    def log_message(self, format, *args):
+        pass  # Silenzia i log HTTP
+
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info(f"Health server avviato su porta {port}")
+    server.serve_forever()
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     logger.info("═══════════════════════════════════")
     logger.info("  TRADING BOT — Avvio sistema")
     logger.info("═══════════════════════════════════")
 
-    scheduler = BlockingScheduler(timezone=ROME_TZ)
+    # Avvia health server in background (richiesto da Railway)
+    health_thread = threading.Thread(target=run_health_server, daemon=True)
+    health_thread.start()
+
+    # Scheduler in background
+    scheduler = BackgroundScheduler(timezone=ROME_TZ)
     scheduler.add_listener(on_job_error, EVENT_JOB_ERROR)
 
-    # Surfista + Il Pendolo: ogni ora al minuto :03 (dati settled)
-    scheduler.add_job(job_surfista, "cron", minute=3,
-                      id="surfista", name="Surfista S&P500")
-    scheduler.add_job(job_pendolo,  "cron", minute=8,
-                      id="pendolo",  name="Il Pendolo Oro")
-
-    # Rompighiaccio: ogni 15 minuti (il job stesso filtra l'orario)
+    scheduler.add_job(job_surfista,      "cron", minute=3,
+                      id="surfista",      name="Surfista S&P500")
+    scheduler.add_job(job_pendolo,       "cron", minute=8,
+                      id="pendolo",       name="Il Pendolo Oro")
     scheduler.add_job(job_rompighiaccio, "interval", minutes=15,
                       id="rompighiaccio", name="Rompighiaccio Nasdaq")
-
-    # Barile Caldo: ogni 4 ore al minuto :15
-    scheduler.add_job(job_barile_caldo, "cron",
+    scheduler.add_job(job_barile_caldo,  "cron",
                       hour="0,4,8,12,16,20", minute=15,
-                      id="barile_caldo", name="Barile Caldo WTI")
+                      id="barile_caldo",  name="Barile Caldo WTI")
 
-    # Messaggio di avvio su Telegram
+    scheduler.start()
     send_startup_message()
 
-    logger.info("Scheduler avviato. Bot in ascolto...")
-    scheduler.start()
+    logger.info("Bot in ascolto...")
+
+    # Tieni vivo il processo principale
+    import time as time_module
+    while True:
+        time_module.sleep(60)
 
 
 if __name__ == "__main__":
