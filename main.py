@@ -1,5 +1,10 @@
 """
-TRADING BOT — Revolut CFD Signal System
+TRADING BOT — 5 Strategie Profittevoli
+1. VWAP Reversal Oro 15min    (PF 1.84) — intraday
+2. London Sweep Oro 15min     (PF 1.55) — intraday 08-10 CET
+3. ORB S&P500 15min           (PF 1.40) — intraday
+4. Kumo Rider Oro 4H          (PF 1.62) — swing
+5. Kumo Rider Nasdaq 1H       (PF 1.51) — swing
 """
 
 import os
@@ -11,7 +16,13 @@ import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.events import EVENT_JOB_ERROR
 
-from strategies import check_surfista, check_pendolo, check_rompighiaccio, check_barile_caldo
+from strategies import (
+    check_vwap_reversal_gold,
+    check_london_sweep_gold,
+    check_orb_sp500,
+    check_kumo_gold_4h,
+    check_kumo_nasdaq_1h,
+)
 from notifier import send_telegram, send_startup_message
 from news_filter import is_news_window
 
@@ -21,143 +32,114 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger(__name__)
-
 ROME_TZ = pytz.timezone("Europe/Rome")
 
+# Anti-duplicazione segnali
 last_signals: dict = {}
 
-
-def should_send(strategy_name: str, direction: str, cooldown_hours: int = 4) -> bool:
+def should_send(name: str, direction: str, cooldown_h: int = 4) -> bool:
     now = datetime.now(ROME_TZ)
-    if strategy_name not in last_signals:
+    if name not in last_signals:
         return True
-    last = last_signals[strategy_name]
-    hours_passed = (now - last["timestamp"]).total_seconds() / 3600
-    if last["direzione"] == direction and hours_passed < cooldown_hours:
-        logger.info(f"[{strategy_name}] Segnale {direction} già inviato {hours_passed:.1f}h fa — skip")
+    last = last_signals[name]
+    hours = (now - last["timestamp"]).total_seconds() / 3600
+    if last["direction"] == direction and hours < cooldown_h:
+        logger.info(f"[{name}] Segnale {direction} già inviato {hours:.1f}h fa — skip")
         return False
     return True
 
+def register(name: str, direction: str):
+    last_signals[name] = {"direction": direction, "timestamp": datetime.now(ROME_TZ)}
 
-def register_signal(strategy_name: str, direction: str):
-    last_signals[strategy_name] = {
-        "direzione": direction,
-        "timestamp": datetime.now(ROME_TZ)
-    }
-
-
-def job_surfista():
-    logger.info("▶ Controllo SURFISTA (S&P500 1H)")
+def run_check(name: str, fn, cooldown_h: int = 4):
     try:
         if is_news_window():
-            logger.info("[Surfista] Finestra news — skip")
+            logger.info(f"[{name}] Finestra news — skip")
             return
-        signal = check_surfista()
-        if signal and should_send("surfista", signal["direzione"], cooldown_hours=4):
+        signal = fn()
+        if signal and should_send(name, signal["direzione"], cooldown_h):
             send_telegram(signal)
-            register_signal("surfista", signal["direzione"])
+            register(name, signal["direzione"])
     except Exception as e:
-        logger.error(f"[Surfista] Errore: {e}")
+        logger.error(f"[{name}] Errore: {e}")
 
+# ── Job functions ─────────────────────────────────────────────────────────────
+def job_vwap_gold():
+    logger.info("▶ VWAP Reversal Oro (15min)")
+    run_check("vwap_gold", check_vwap_reversal_gold, cooldown_h=4)
 
-def job_pendolo():
-    logger.info("▶ Controllo IL PENDOLO (Oro 1H)")
-    try:
-        if is_news_window():
-            logger.info("[Pendolo] Finestra news — skip")
-            return
-        signal = check_pendolo()
-        if signal and should_send("pendolo", signal["direzione"], cooldown_hours=4):
-            send_telegram(signal)
-            register_signal("pendolo", signal["direzione"])
-    except Exception as e:
-        logger.error(f"[Pendolo] Errore: {e}")
-
-
-def job_rompighiaccio():
+def job_london_sweep():
     now = datetime.now(ROME_TZ)
-    if not (time(15, 25) <= now.time() <= time(17, 35)):
+    if not (time(8, 0) <= now.time() <= time(10, 0)):
         return
-    logger.info("▶ Controllo ROMPIGHIACCIO (Nasdaq 15min)")
-    try:
-        if is_news_window():
-            logger.info("[Rompighiaccio] Finestra news — skip")
-            return
-        signal = check_rompighiaccio()
-        if signal and should_send("rompighiaccio", signal["direzione"], cooldown_hours=8):
-            send_telegram(signal)
-            register_signal("rompighiaccio", signal["direzione"])
-    except Exception as e:
-        logger.error(f"[Rompighiaccio] Errore: {e}")
+    logger.info("▶ London Sweep Oro (15min)")
+    run_check("london_sweep", check_london_sweep_gold, cooldown_h=12)
 
+def job_orb_sp500():
+    now = datetime.now(ROME_TZ)
+    if not (time(15, 45) <= now.time() <= time(21, 45)):
+        return
+    logger.info("▶ ORB S&P500 (15min)")
+    run_check("orb_sp500", check_orb_sp500, cooldown_h=8)
 
-def job_barile_caldo():
-    logger.info("▶ Controllo BARILE CALDO (WTI 4H)")
-    try:
-        signal = check_barile_caldo()
-        if signal and should_send("barile_caldo", signal["direzione"], cooldown_hours=12):
-            send_telegram(signal)
-            register_signal("barile_caldo", signal["direzione"])
-    except Exception as e:
-        logger.error(f"[Barile Caldo] Errore: {e}")
+def job_kumo_gold_4h():
+    logger.info("▶ Kumo Rider Oro (4H)")
+    run_check("kumo_gold_4h", check_kumo_gold_4h, cooldown_h=12)
 
+def job_kumo_nasdaq():
+    now = datetime.now(ROME_TZ)
+    if not (time(15, 30) <= now.time() <= time(21, 0)):
+        return
+    logger.info("▶ Kumo Rider Nasdaq (1H)")
+    run_check("kumo_nasdaq", check_kumo_nasdaq_1h, cooldown_h=8)
 
-def on_job_error(event):
-    logger.error(f"Job fallito: {event.exception}")
-
-
-# ── Health check server (richiesto da Railway) ────────────────────────────────
+# ── Health server ─────────────────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"Trading Bot OK")
-
     def log_message(self, format, *args):
-        pass  # Silenzia i log HTTP
-
+        pass
 
 def run_health_server():
     port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logger.info(f"Health server avviato su porta {port}")
-    server.serve_forever()
-
+    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    logger.info("═══════════════════════════════════")
-    logger.info("  TRADING BOT — Avvio sistema")
-    logger.info("═══════════════════════════════════")
+    logger.info("═══════════════════════════════════════")
+    logger.info("  TRADING BOT — 5 Strategie Profittevoli")
+    logger.info("═══════════════════════════════════════")
 
-    # Avvia health server in background (richiesto da Railway)
-    health_thread = threading.Thread(target=run_health_server, daemon=True)
-    health_thread.start()
+    threading.Thread(target=run_health_server, daemon=True).start()
 
-    # Scheduler in background
     scheduler = BackgroundScheduler(timezone=ROME_TZ)
-    scheduler.add_listener(on_job_error, EVENT_JOB_ERROR)
+    scheduler.add_listener(lambda e: logger.error(f"Job error: {e.exception}"), EVENT_JOB_ERROR)
 
-    scheduler.add_job(job_surfista,      "cron", minute=3,
-                      id="surfista",      name="Surfista S&P500")
-    scheduler.add_job(job_pendolo,       "cron", minute=8,
-                      id="pendolo",       name="Il Pendolo Oro")
-    scheduler.add_job(job_rompighiaccio, "interval", minutes=15,
-                      id="rompighiaccio", name="Rompighiaccio Nasdaq")
-    scheduler.add_job(job_barile_caldo,  "cron",
-                      hour="0,4,8,12,16,20", minute=15,
-                      id="barile_caldo",  name="Barile Caldo WTI")
+    # VWAP Reversal Oro: ogni 15min (orario filtrato internamente)
+    scheduler.add_job(job_vwap_gold,    "interval", minutes=15, id="vwap_gold")
+
+    # London Sweep: ogni 15min dalle 08-10 (filtro interno)
+    scheduler.add_job(job_london_sweep, "interval", minutes=15, id="london_sweep")
+
+    # ORB S&P500: ogni 15min dalle 15:45-21:45 (filtro interno)
+    scheduler.add_job(job_orb_sp500,    "interval", minutes=15, id="orb_sp500")
+
+    # Kumo Gold 4H: ogni 4 ore
+    scheduler.add_job(job_kumo_gold_4h, "cron",
+                      hour="0,4,8,12,16,20", minute=20, id="kumo_gold_4h")
+
+    # Kumo Nasdaq 1H: ogni ora durante sessione USA
+    scheduler.add_job(job_kumo_nasdaq,  "cron", minute=5, id="kumo_nasdaq")
 
     scheduler.start()
     send_startup_message()
-
     logger.info("Bot in ascolto...")
 
-    # Tieni vivo il processo principale
     import time as time_module
     while True:
         time_module.sleep(60)
-
 
 if __name__ == "__main__":
     main()
