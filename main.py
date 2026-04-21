@@ -131,4 +131,8 @@ except Exception as e:
 
 logger.info("Bot in ascolto...")
 while True:
-    time_module.sleep(60)
+    try:
+        time_module.sleep(60)
+    except Exception as e:
+        logger.error(f"Loop error: {e}")
+        time_module.sleep(10)
