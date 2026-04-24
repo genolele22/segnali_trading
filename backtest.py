@@ -231,6 +231,401 @@ def backtest_barile_caldo():
     return simulate(pd.DataFrame(signals), COSTS["WTI"], "🛢️ BARILE CALDO (WTI 4H)")
 
 
+# ── ORB S&P500 — backtest parametrico ────────────────────────────────────────
+def backtest_orb_sp500(label="ORB BASE", time_limit=time(21, 45),
+                       atr_buf=0.1, vol_mult=None, rsi_long=52, rsi_short=48):
+    print(f"⏳ Backtest {label}...")
+    df = get_data("^GSPC", "60d", "15m")
+    if df is None:
+        return None
+
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    df.index = df.index.tz_convert(ROME_TZ)
+
+    df["ema20"] = ema(df["Close"], 20)
+    df["rsi14"] = rsi(df["Close"], 14)
+    df["atr14"] = atr_calc(df, 14)
+
+    # VWAP giornaliero
+    parts = []
+    for d, g in df.groupby(df.index.date):
+        tp = (g["High"] + g["Low"] + g["Close"]) / 3
+        parts.append((tp * g["Volume"]).cumsum() / g["Volume"].cumsum())
+    df["vwap"] = pd.concat(parts).reindex(df.index)
+    df.dropna(inplace=True)
+
+    signals = []
+    for d in sorted(set(df.index.date)):
+        day_df = df[df.index.date == d]
+
+        or_bar = day_df[day_df.index.time == time(15, 30)]
+        if len(or_bar) == 0:
+            continue
+        or_high    = or_bar["High"].iloc[0]
+        or_low     = or_bar["Low"].iloc[0]
+        or_range   = or_high - or_low
+        atr_day    = day_df["atr14"].mean()
+        if or_range > 2.5 * atr_day:
+            continue
+
+        window = day_df[(day_df.index.time >= time(15, 45)) &
+                        (day_df.index.time <= time_limit)]
+
+        traded = False
+        for i in range(len(window) - 1):
+            if traded:
+                break
+            curr     = window.iloc[i]
+            pos      = df.index.get_loc(window.index[i])
+            if pos < 1:
+                continue
+            prev     = df.iloc[pos - 1]
+            entry    = curr["Close"]
+            a        = curr["atr14"]
+
+            if vol_mult is not None:
+                vol_avg = day_df["Volume"].iloc[:day_df.index.get_loc(window.index[i]) + 1].tail(10).mean()
+                if vol_avg > 0 and curr["Volume"] < vol_mult * vol_avg:
+                    continue
+
+            sig = None
+            if (entry > or_high + atr_buf * a and
+                    entry > curr["vwap"] and
+                    curr["ema20"] > prev["ema20"] and
+                    curr["rsi14"] > rsi_long):
+                sl   = max(or_low, entry - 2.0 * a)
+                risk = entry - sl
+                if risk > 0:
+                    sig = {"direction": 1, "entry": entry, "sl": sl,
+                           "tp": entry + 2.5 * risk}
+
+            elif (entry < or_low - atr_buf * a and
+                    entry < curr["vwap"] and
+                    curr["ema20"] < prev["ema20"] and
+                    curr["rsi14"] < rsi_short):
+                sl   = min(or_high, entry + 2.0 * a)
+                risk = sl - entry
+                if risk > 0:
+                    sig = {"direction": -1, "entry": entry, "sl": sl,
+                           "tp": entry - 2.5 * risk}
+
+            if sig is None:
+                continue
+
+            # Simula forward con High/Low fino a fine sessione
+            future     = window.iloc[i + 1:]
+            exit_price = future.iloc[-1]["Close"] if len(future) > 0 else entry
+            for _, fc in future.iterrows():
+                if sig["direction"] == 1:
+                    if fc["Low"] <= sig["sl"]:
+                        exit_price = sig["sl"];  break
+                    if fc["High"] >= sig["tp"]:
+                        exit_price = sig["tp"];  break
+                else:
+                    if fc["High"] >= sig["sl"]:
+                        exit_price = sig["sl"];  break
+                    if fc["Low"] <= sig["tp"]:
+                        exit_price = sig["tp"];  break
+
+            sig["next_close"] = exit_price
+            signals.append(sig)
+            traded = True
+
+    if not signals:
+        print(f"  Nessun segnale per {label}")
+        return None
+    return simulate(pd.DataFrame(signals), COSTS["SP500"], f"🟢 {label}")
+
+
+# ── Helper: simula forward fino a fine sessione ───────────────────────────────
+def _forward_exit(future_df, direction, sl, tp):
+    if len(future_df) == 0:
+        return None
+    for _, fc in future_df.iterrows():
+        if direction == 1:
+            if fc["Low"]  <= sl: return sl
+            if fc["High"] >= tp: return tp
+        else:
+            if fc["High"] >= sl: return sl
+            if fc["Low"]  <= tp: return tp
+    return future_df.iloc[-1]["Close"]
+
+
+# ── STRATEGIA INNOVATIVA 1: LIQUIDITY GRAB ────────────────────────────────────
+# Concetto: le istituzioni "cacciano" la liquidità oltre l'OR per poi invertire.
+# Segnale: wick che sfonda OR high/low ma la candela CHIUDE dentro l'OR.
+# Logica: il fakeout è confermato → entrata opposta con SL stretto sul wick.
+# ─────────────────────────────────────────────────────────────────────────────
+def backtest_liquidity_grab():
+    print("⏳ Backtest LIQUIDITY GRAB (S&P500 15min)...")
+    df = get_data("^GSPC", "60d", "15m")
+    if df is None: return None
+
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    df.index = df.index.tz_convert(ROME_TZ)
+
+    df["atr14"] = atr_calc(df, 14)
+    parts = []
+    for d, g in df.groupby(df.index.date):
+        tp_val = (g["High"] + g["Low"] + g["Close"]) / 3
+        parts.append((tp_val * g["Volume"]).cumsum() / g["Volume"].cumsum())
+    df["vwap"] = pd.concat(parts).reindex(df.index)
+    df.dropna(inplace=True)
+
+    signals = []
+    for d in sorted(set(df.index.date)):
+        day_df = df[df.index.date == d]
+        or_bar = day_df[day_df.index.time == time(15, 30)]
+        if len(or_bar) == 0: continue
+
+        or_high  = or_bar["High"].iloc[0]
+        or_low   = or_bar["Low"].iloc[0]
+        or_range = or_high - or_low
+        if or_range < 2.0: continue  # OR troppo stretto = rumore di mercato
+
+        # Finestra caccia liquidità: 15:30-17:30 (prime 2h di sessione USA)
+        window = day_df[(day_df.index.time >= time(15, 30)) &
+                        (day_df.index.time <= time(17, 30))]
+        session_end = day_df[day_df.index.time <= time(21, 45)]
+
+        traded = False
+        for i in range(1, len(window) - 1):
+            if traded: break
+            curr = window.iloc[i]
+            a    = curr["atr14"]
+            wick_min = max(0.3 * a, 2.0)  # wick minimo significativo
+
+            or_mid = (or_high + or_low) / 2  # centro naturale dell'OR
+
+            # GRAB RIALZISTA → segnale SHORT
+            # Wick sopra OR high, chiude dentro → short verso centro OR
+            if (curr["High"] > or_high + wick_min and
+                    curr["Close"] < or_high and
+                    curr["Close"] < curr["Open"]):
+                entry = curr["Close"]
+                sl    = curr["High"] + 2.0   # SL oltre il wick
+                risk  = sl - entry
+                if risk <= 0 or risk > 35: continue
+                # TP = centro OR (target naturale del reversal)
+                tp = or_mid if or_mid < entry else or_low
+                if tp >= entry: continue
+                # Filtra se R:R < 0.5 (troppo piccolo per coprire lo spread)
+                if (entry - tp) < 0.5 * risk: continue
+                future = session_end[session_end.index > window.index[i]]
+                exit_p = _forward_exit(future, -1, sl, tp)
+                if exit_p is None: continue
+                signals.append({"direction": -1, "entry": entry,
+                                 "sl": sl, "tp": tp, "next_close": exit_p})
+                traded = True
+
+            # GRAB RIBASSISTA → segnale LONG
+            # Wick sotto OR low, chiude dentro → long verso centro OR
+            elif (curr["Low"] < or_low - wick_min and
+                      curr["Close"] > or_low and
+                      curr["Close"] > curr["Open"]):
+                entry = curr["Close"]
+                sl    = curr["Low"] - 2.0    # SL oltre il wick
+                risk  = entry - sl
+                if risk <= 0 or risk > 35: continue
+                tp = or_mid if or_mid > entry else or_high
+                if tp <= entry: continue
+                if (tp - entry) < 0.5 * risk: continue
+                future = session_end[session_end.index > window.index[i]]
+                exit_p = _forward_exit(future, 1, sl, tp)
+                if exit_p is None: continue
+                signals.append({"direction": 1, "entry": entry,
+                                 "sl": sl, "tp": tp, "next_close": exit_p})
+                traded = True
+
+    if not signals:
+        print("  Nessun segnale LIQUIDITY GRAB")
+        return None
+    return simulate(pd.DataFrame(signals), COSTS["SP500"], "⚡ LIQUIDITY GRAB")
+
+
+# ── STRATEGIA INNOVATIVA 2: INITIAL BALANCE BREAKOUT ─────────────────────────
+# Concetto: il range della prima ORA (Initial Balance, termine pro) è il
+# livello più usato dai trader istituzionali. Breakout dopo 16:30 = segnale vero.
+# Differenza dall'ORB: 4 candele da 15min invece di 1 → livello più robusto.
+# ─────────────────────────────────────────────────────────────────────────────
+def backtest_initial_balance():
+    print("⏳ Backtest INITIAL BALANCE BREAKOUT (S&P500)...")
+    df = get_data("^GSPC", "60d", "15m")
+    if df is None: return None
+
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    df.index = df.index.tz_convert(ROME_TZ)
+
+    df["ema20"] = ema(df["Close"], 20)
+    df["rsi14"] = rsi(df["Close"], 14)
+    df["atr14"] = atr_calc(df, 14)
+    parts = []
+    for d, g in df.groupby(df.index.date):
+        tp_val = (g["High"] + g["Low"] + g["Close"]) / 3
+        parts.append((tp_val * g["Volume"]).cumsum() / g["Volume"].cumsum())
+    df["vwap"] = pd.concat(parts).reindex(df.index)
+    df.dropna(inplace=True)
+
+    signals = []
+    for d in sorted(set(df.index.date)):
+        day_df = df[df.index.date == d]
+
+        # Initial Balance = 15:30-16:30 CET (4 candele da 15min)
+        ib = day_df[(day_df.index.time >= time(15, 30)) &
+                    (day_df.index.time < time(16, 30))]
+        if len(ib) < 4: continue
+
+        ib_high  = ib["High"].max()
+        ib_low   = ib["Low"].min()
+        ib_range = ib_high - ib_low
+        atr_day  = day_df["atr14"].mean()
+        # IB troppo largo = giorno volatile = skip
+        if ib_range > 3.0 * atr_day: continue
+        # IB troppo stretto = consolidamento debole = skip
+        if ib_range < 0.5 * atr_day: continue
+
+        # Finestra operativa: dopo l'IB, fino a 21:45
+        window = day_df[(day_df.index.time >= time(16, 30)) &
+                        (day_df.index.time <= time(21, 45))]
+        session_end = day_df[day_df.index.time <= time(21, 45)]
+
+        traded = False
+        for i in range(len(window) - 1):
+            if traded: break
+            curr = window.iloc[i]
+            pos  = df.index.get_loc(window.index[i])
+            if pos < 1: continue
+            prev = df.iloc[pos - 1]
+            entry = curr["Close"]
+            a     = curr["atr14"]
+
+            # LONG: close sopra IB high + sopra VWAP + RSI > 55
+            if (entry > ib_high + 0.15 * a and
+                    entry > curr["vwap"] and
+                    curr["rsi14"] > 55 and
+                    curr["ema20"] > prev["ema20"]):
+                sl   = max(ib_low, entry - 2.0 * a)
+                risk = entry - sl
+                if risk <= 0: continue
+                tp   = entry + 2.5 * risk
+                future = session_end[session_end.index > window.index[i]]
+                exit_p = _forward_exit(future, 1, sl, tp)
+                if exit_p is None: continue
+                signals.append({"direction": 1, "entry": entry,
+                                 "sl": sl, "tp": tp, "next_close": exit_p})
+                traded = True
+
+            # SHORT: close sotto IB low + sotto VWAP + RSI < 45
+            elif (entry < ib_low - 0.15 * a and
+                      entry < curr["vwap"] and
+                      curr["rsi14"] < 45 and
+                      curr["ema20"] < prev["ema20"]):
+                sl   = min(ib_high, entry + 2.0 * a)
+                risk = sl - entry
+                if risk <= 0: continue
+                tp   = entry - 2.5 * risk
+                future = session_end[session_end.index > window.index[i]]
+                exit_p = _forward_exit(future, -1, sl, tp)
+                if exit_p is None: continue
+                signals.append({"direction": -1, "entry": entry,
+                                 "sl": sl, "tp": tp, "next_close": exit_p})
+                traded = True
+
+    if not signals:
+        print("  Nessun segnale INITIAL BALANCE")
+        return None
+    return simulate(pd.DataFrame(signals), COSTS["SP500"], "🏛️  INITIAL BALANCE")
+
+
+# ── STRATEGIA INNOVATIVA 3: GAP FILL ──────────────────────────────────────────
+# Concetto: S&P500 richiude il gap rispetto alla chiusura precedente ~70% volte.
+# Edge statistico puro, senza indicatori. Entra nella direzione del fill.
+# SL: oltre il massimo/minimo della candela di apertura. TP: chiusura precedente.
+# ─────────────────────────────────────────────────────────────────────────────
+def backtest_gap_fill():
+    print("⏳ Backtest GAP FILL (S&P500 15min)...")
+    df = get_data("^GSPC", "60d", "15m")
+    if df is None: return None
+
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    df.index = df.index.tz_convert(ROME_TZ)
+
+    df["atr14"] = atr_calc(df, 14)
+    df.dropna(inplace=True)
+
+    signals = []
+    days = sorted(set(df.index.date))
+
+    for idx, d in enumerate(days[1:], 1):
+        prev_day = days[idx - 1]
+        day_df   = df[df.index.date == d]
+        prev_df  = df[df.index.date == prev_day]
+
+        # Chiusura del giorno precedente (ultima candela entro 22:00)
+        prev_sess = prev_df[prev_df.index.time <= time(22, 0)]
+        if len(prev_sess) == 0: continue
+        prev_close = prev_sess.iloc[-1]["Close"]
+
+        # Apertura US di oggi (candela 15:30)
+        open_bar = day_df[day_df.index.time == time(15, 30)]
+        if len(open_bar) == 0: continue
+        today_open = open_bar["Open"].iloc[0]
+        a = open_bar["atr14"].iloc[0]
+
+        gap = today_open - prev_close
+        gap_pct = abs(gap) / prev_close * 100
+
+        # Gap significativo: almeno 0.2% e almeno 0.5*ATR
+        if gap_pct < 0.2 or abs(gap) < 0.5 * a: continue
+        # Gap troppo grande: oltre 1.5% = evento macro, non fare fill
+        if gap_pct > 1.5: continue
+
+        # GAP UP → fill verso il basso → SHORT
+        session_end = day_df[day_df.index.time <= time(21, 45)]
+        if gap > 0:
+            # Aspetta conferma: candela di 15:45 chiude sotto il low di apertura
+            confirm_bar = day_df[day_df.index.time == time(15, 45)]
+            if len(confirm_bar) == 0: continue
+            if confirm_bar.iloc[0]["Close"] >= open_bar.iloc[0]["Low"]: continue
+            entry = confirm_bar.iloc[0]["Close"]
+            sl    = open_bar.iloc[0]["High"] + 1.0
+            risk  = sl - entry
+            if risk <= 0 or risk > 20: continue
+            tp    = prev_close
+            if tp >= entry: continue
+            future = session_end[session_end.index > confirm_bar.index[0]]
+            exit_p = _forward_exit(future, -1, sl, tp)
+            if exit_p is None: continue
+            signals.append({"direction": -1, "entry": entry,
+                             "sl": sl, "tp": tp, "next_close": exit_p})
+
+        # GAP DOWN → fill verso l'alto → LONG
+        else:
+            confirm_bar = day_df[day_df.index.time == time(15, 45)]
+            if len(confirm_bar) == 0: continue
+            if confirm_bar.iloc[0]["Close"] <= open_bar.iloc[0]["High"]: continue
+            entry = confirm_bar.iloc[0]["Close"]
+            sl    = open_bar.iloc[0]["Low"] - 1.0
+            risk  = entry - sl
+            if risk <= 0 or risk > 20: continue
+            tp    = prev_close
+            if tp <= entry: continue
+            future = session_end[session_end.index > confirm_bar.index[0]]
+            exit_p = _forward_exit(future, 1, sl, tp)
+            if exit_p is None: continue
+            signals.append({"direction": 1, "entry": entry,
+                             "sl": sl, "tp": tp, "next_close": exit_p})
+
+    if not signals:
+        print("  Nessun segnale GAP FILL")
+        return None
+    return simulate(pd.DataFrame(signals), COSTS["SP500"], "🔄 GAP FILL")
+
+
 # ── Output ────────────────────────────────────────────────────────────────────
 def print_results(results):
     print("\n"+"═"*65)
@@ -252,9 +647,150 @@ def print_results(results):
     print("⚠️  Fai sempre paper trading prima del denaro reale.\n")
 
 
+# ── STRATEGIA INNOVATIVA 4: ORB + REGIME FILTER ──────────────────────────────
+# Concetto: il regime di mercato determina se un breakout funzionerà.
+# - VIX > 22 = mercato choppy → skip tutto
+# - S&P500 sopra SMA20 giornaliera → solo LONG
+# - S&P500 sotto SMA20 giornaliera → solo SHORT
+# Fonti dati: ^VIX e ^GSPC daily + 15min intraday
+# ─────────────────────────────────────────────────────────────────────────────
+def backtest_orb_regime():
+    print("⏳ Backtest ORB + REGIME FILTER (VIX + Trend)...")
+
+    df_15m = get_data("^GSPC", "60d", "15m")
+    df_day = get_data("^GSPC", "1y",  "1d")
+    df_vix = get_data("^VIX",  "1y",  "1d")
+    if df_15m is None or df_day is None or df_vix is None:
+        return None
+
+    if df_15m.index.tz is None:
+        df_15m.index = df_15m.index.tz_localize("UTC")
+    df_15m.index = df_15m.index.tz_convert(ROME_TZ)
+
+    df_15m["ema20"] = ema(df_15m["Close"], 20)
+    df_15m["rsi14"] = rsi(df_15m["Close"], 14)
+    df_15m["atr14"] = atr_calc(df_15m, 14)
+    parts = []
+    for d, g in df_15m.groupby(df_15m.index.date):
+        tp_val = (g["High"] + g["Low"] + g["Close"]) / 3
+        parts.append((tp_val * g["Volume"]).cumsum() / g["Volume"].cumsum())
+    df_15m["vwap"] = pd.concat(parts).reindex(df_15m.index)
+    df_15m.dropna(inplace=True)
+
+    # SMA20 giornaliera S&P500
+    df_day["sma20"] = df_day["Close"].rolling(20).mean()
+    df_day.dropna(inplace=True)
+
+    def get_regime(date):
+        # VIX del giorno precedente
+        vix_hist = df_vix[df_vix.index.date < date]
+        if len(vix_hist) == 0:
+            return None
+        vix_val = vix_hist.iloc[-1]["Close"]
+        if vix_val > 22:
+            return None  # mercato troppo volatile, segnale inaffidabile
+
+        # Trend S&P500: sopra/sotto SMA20 daily
+        day_hist = df_day[df_day.index.date < date]
+        if len(day_hist) == 0:
+            return None
+        last = day_hist.iloc[-1]
+        if last["Close"] > last["sma20"]:
+            return 1   # regime LONG
+        else:
+            return -1  # regime SHORT
+
+    signals = []
+    for d in sorted(set(df_15m.index.date)):
+        regime = get_regime(d)
+        if regime is None:
+            continue  # VIX alto o dati insufficienti
+
+        day_df = df_15m[df_15m.index.date == d]
+        or_bar = day_df[day_df.index.time == time(15, 30)]
+        if len(or_bar) == 0:
+            continue
+
+        or_high  = or_bar["High"].iloc[0]
+        or_low   = or_bar["Low"].iloc[0]
+        or_range = or_high - or_low
+        atr_day  = day_df["atr14"].mean()
+        if or_range > 2.5 * atr_day:
+            continue
+
+        window = day_df[(day_df.index.time >= time(15, 45)) &
+                        (day_df.index.time <= time(21, 45))]
+        session_end = day_df[day_df.index.time <= time(21, 45)]
+
+        traded = False
+        for i in range(len(window) - 1):
+            if traded:
+                break
+            curr  = window.iloc[i]
+            pos   = df_15m.index.get_loc(window.index[i])
+            if pos < 1:
+                continue
+            prev  = df_15m.iloc[pos - 1]
+            entry = curr["Close"]
+            a     = curr["atr14"]
+
+            if (regime == 1 and
+                    entry > or_high + 0.1 * a and
+                    entry > curr["vwap"] and
+                    curr["ema20"] > prev["ema20"] and
+                    curr["rsi14"] > 52):
+                sl   = max(or_low, entry - 2.0 * a)
+                risk = entry - sl
+                if risk <= 0:
+                    continue
+                tp = entry + 2.5 * risk
+                future = session_end[session_end.index > window.index[i]]
+                exit_p = _forward_exit(future, 1, sl, tp)
+                if exit_p is None:
+                    continue
+                signals.append({"direction": 1, "entry": entry,
+                                 "sl": sl, "tp": tp, "next_close": exit_p})
+                traded = True
+
+            elif (regime == -1 and
+                      entry < or_low - 0.1 * a and
+                      entry < curr["vwap"] and
+                      curr["ema20"] < prev["ema20"] and
+                      curr["rsi14"] < 48):
+                sl   = min(or_high, entry + 2.0 * a)
+                risk = sl - entry
+                if risk <= 0:
+                    continue
+                tp = entry - 2.5 * risk
+                future = session_end[session_end.index > window.index[i]]
+                exit_p = _forward_exit(future, -1, sl, tp)
+                if exit_p is None:
+                    continue
+                signals.append({"direction": -1, "entry": entry,
+                                 "sl": sl, "tp": tp, "next_close": exit_p})
+                traded = True
+
+    if not signals:
+        print("  Nessun segnale ORB REGIME")
+        return None
+    return simulate(pd.DataFrame(signals), COSTS["SP500"], "🧭 ORB + REGIME")
+
+
 if __name__ == "__main__":
-    print("🔍 Avvio backtest su dati storici reali...")
-    print("   (può richiedere 2-5 minuti)\n")
-    results = [backtest_surfista(), backtest_pendolo(),
-               backtest_rompighiaccio(), backtest_barile_caldo()]
-    print_results([r for r in results if r is not None])
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "orb":
+        print("🔍 Ottimizzazione ORB S&P500 — 60 giorni dati...\n")
+        results = [
+            backtest_orb_sp500("ORB BASE (attuale)"),
+            backtest_liquidity_grab(),
+            backtest_initial_balance(),
+            backtest_gap_fill(),
+            backtest_orb_regime(),
+        ]
+        print_results([r for r in results if r is not None])
+    else:
+        print("🔍 Avvio backtest su dati storici reali...")
+        print("   (può richiedere 2-5 minuti)\n")
+        results = [backtest_surfista(), backtest_pendolo(),
+                   backtest_rompighiaccio(), backtest_barile_caldo()]
+        print_results([r for r in results if r is not None])
