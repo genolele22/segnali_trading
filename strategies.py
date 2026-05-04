@@ -119,12 +119,13 @@ def check_vwap_reversal_gold() -> Optional[dict]:
     if len(df) < 3:
         return None
 
-    last_cet = df.index[-1].tz_convert(ROME_TZ)
+    # Usa [-2] = ultima candela CHIUSA, [-1] è ancora in formazione
+    last_cet = df.index[-2].tz_convert(ROME_TZ)
     if not (time(8, 0) <= last_cet.time() <= time(21, 45)):
         return None
 
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
+    curr = df.iloc[-2]
+    prev = df.iloc[-3]
     entry = curr["Close"]
     a     = curr["atr14"]
 
@@ -202,10 +203,11 @@ def check_london_sweep_gold() -> Optional[dict]:
     # Ultime 2 candele nella finestra operativa
     window = today_df[(today_df.index.time >= time(8, 0)) &
                       (today_df.index.time <= now_cet.time())]
-    if len(window) < 2:
+    if len(window) < 3:
         return None
 
-    curr = window.iloc[-1]
+    # Usa [-2] = ultima candela chiusa, [-1] è ancora in formazione
+    curr = window.iloc[-2]
     a    = curr["atr14"]
 
     # Sweep: candela corrente ha toccato sotto asia_low di $2-$5
@@ -218,7 +220,7 @@ def check_london_sweep_gold() -> Optional[dict]:
         return None
 
     # SMA20 piatta o in discesa (trapped shorts)
-    sma_slope = df["sma20"].iloc[-1] - df["sma20"].iloc[-4]
+    sma_slope = df["sma20"].iloc[-2] - df["sma20"].iloc[-5]
     if sma_slope > 0.5:
         return None
 
@@ -287,8 +289,9 @@ def check_orb_sp500() -> Optional[dict]:
     if or_range > 2.5 * atr_day:
         return None
 
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
+    # Usa [-2] = ultima candela chiusa, [-1] è ancora in formazione
+    curr = df.iloc[-2]
+    prev = df.iloc[-3]
     entry = curr["Close"]
     a     = curr["atr14"]
 
@@ -365,11 +368,12 @@ def check_kumo_gold_4h() -> Optional[dict]:
     df["atr14"]  = atr(df, 14)
     df.dropna(inplace=True)
 
-    if len(df) < 3:
+    if len(df) < 4:
         return None
 
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
+    # Usa [-2] = ultima candela 4H chiusa, [-1] è ancora in formazione
+    curr = df.iloc[-2]
+    prev = df.iloc[-3]
 
     kumo_top = max(curr["s_a"], curr["s_b"])
     kumo_bot = min(curr["s_a"], curr["s_b"])
@@ -379,7 +383,7 @@ def check_kumo_gold_4h() -> Optional[dict]:
 
     entry       = curr["Close"]
     a           = curr["atr14"]
-    chikou_ref  = df["Close"].iloc[-27] if len(df) > 27 else df["Close"].iloc[0]
+    chikou_ref  = df["Close"].iloc[-28] if len(df) > 28 else df["Close"].iloc[0]
 
     if (cross_up and entry > kumo_top and
             40 < curr["rsi14"] < 65 and
@@ -444,15 +448,16 @@ def check_kumo_nasdaq_1h() -> Optional[dict]:
     df["atr14"]  = atr(df, 14)
     df.dropna(inplace=True)
 
-    if len(df) < 3:
+    if len(df) < 4:
         return None
 
-    last_cet = df.index[-1].tz_convert(ROME_TZ)
+    # Usa [-2] = ultima candela 1H chiusa, [-1] è ancora in formazione
+    last_cet = df.index[-2].tz_convert(ROME_TZ)
     if not (time(15, 30) <= last_cet.time() <= time(21, 0)):
         return None
 
-    curr = df.iloc[-1]
-    prev = df.iloc[-2]
+    curr = df.iloc[-2]
+    prev = df.iloc[-3]
 
     kumo_top = max(curr["s_a"], curr["s_b"])
     kumo_bot = min(curr["s_a"], curr["s_b"])
@@ -462,7 +467,7 @@ def check_kumo_nasdaq_1h() -> Optional[dict]:
 
     entry      = curr["Close"]
     a          = curr["atr14"]
-    chikou_ref = df["Close"].iloc[-27] if len(df) > 27 else df["Close"].iloc[0]
+    chikou_ref = df["Close"].iloc[-28] if len(df) > 28 else df["Close"].iloc[0]
 
     if (cross_up and entry > kumo_top and
             40 < curr["rsi14"] < 65 and
